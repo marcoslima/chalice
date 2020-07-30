@@ -11,6 +11,7 @@ from chalice import app
 from chalice import local, BadRequestError, CORSConfig
 from chalice import Response
 from chalice import IAMAuthorizer
+from chalice import CognitoUserPoolAuthorizer
 from chalice.config import Config
 from chalice.local import LambdaContext
 from chalice.local import LocalARNBuilder
@@ -146,6 +147,14 @@ def sample_app():
                         status_code=200,
                         headers={'Content-Type': 'application/octet-stream'})
 
+    @demo.route('/multi-value-header')
+    def multi_value_header():
+        return Response(body={},
+                        status_code=200,
+                        headers={
+                            'Set-Cookie': ['CookieA=ValueA', 'CookieB=ValueB']
+                        })
+
     return demo
 
 
@@ -230,6 +239,8 @@ def demo_app_auth():
 
     iam_authorizer = IAMAuthorizer()
 
+    cognito_authorizer = CognitoUserPoolAuthorizer('app-name', [])
+
     @demo.route('/', authorizer=landing_page_auth)
     def landing_view():
         return {}
@@ -256,6 +267,10 @@ def demo_app_auth():
 
     @demo.route('/iam', authorizer=iam_authorizer)
     def iam_route():
+        return {}
+
+    @demo.route('/cognito', authorizer=cognito_authorizer)
+    def cognito_route():
         return {}
 
     @demo.route('/none', authorizer=demo_authorizer_returns_none)
@@ -511,6 +526,14 @@ def test_can_deny_unauthed_request(auth_handler):
     assert b'x-amzn-ErrorType: UnauthorizedException' in response_lines
     assert b'Content-Type: application/json' in response_lines
     assert b'{"message":"Unauthorized"}' in response_lines
+
+
+def test_multi_value_header(handler):
+    set_current_request(handler, method='GET', path='/multi-value-header')
+    handler.do_GET()
+    response = handler.wfile.getvalue().decode().splitlines()
+    assert 'Set-Cookie: CookieA=ValueA' in response
+    assert 'Set-Cookie: CookieB=ValueB' in response
 
 
 @pytest.mark.parametrize('actual_url,matched_url', [
@@ -913,6 +936,41 @@ class TestLocalBuiltinAuthorizers(object):
         context = LambdaContext(*lambda_context_args)
         with pytest.raises(NotAuthorizedError):
             authorizer.authorize(path, event, context)
+
+    def test_can_understand_cognito_token(self, lambda_context_args,
+                                          demo_app_auth, create_event):
+        # Ensures that / routes work since that is a special case in the
+        # API Gateway arn generation where an extra / is appended to the end
+        # of the arn.
+        authorizer = LocalGatewayAuthorizer(demo_app_auth)
+        path = '/cognito'
+        event = create_event(path, 'GET', {})
+        event["headers"]["authorization"] = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhYWFhYWFhYS1iYmJiLWNjY2MtZGRkZC1lZWVlZWVlZWVlZWUiLCJhdWQiOiJ4eHh4eHh4eHh4eHhleGFtcGxlIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsInRva2VuX3VzZSI6ImlkIiwiYXV0aF90aW1lIjoxNTAwMDA5NDAwLCJpc3MiOiJodHRwczovL2NvZ25pdG8taWRwLnVzLWVhc3QtMS5hbWF6b25hd3MuY29tL3VzLWVhc3QtMV9leGFtcGxlIiwiY29nbml0bzp1c2VybmFtZSI6ImphbmVkb2UiLCJleHAiOjE1ODQ3MjM2MTYsImdpdmVuX25hbWUiOiJKYW5lIiwiaWF0IjoxNTAwMDA5NDAwLCJlbWFpbCI6ImphbmVkb2VAZXhhbXBsZS5jb20iLCJqdGkiOiJkN2UxMTMzYS0xZTNhLTQyMzEtYWU3Yi0yOGQ4NWVlMGIxNGQifQ.p35Yj9KJD5RbfPWGL08IJHgson8BhdGLPQqUOiF0-KM"  # noqa
+        context = LambdaContext(*lambda_context_args)
+        event, context = authorizer.authorize(path, event, context)
+        principal_id = event['requestContext']['authorizer']['principalId']
+        assert principal_id == 'janedoe'
+
+    def test_does_authorize_unsupported_cognito_token(self,
+                                                      lambda_context_args,
+                                                      demo_app_auth,
+                                                      create_event):
+        authorizer = LocalGatewayAuthorizer(demo_app_auth)
+        path = '/cognito'
+        event = create_event(path, 'GET', {})
+        event["headers"]["authorization"] = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhYWFhYWFhYS1iYmJiLWNjY2MtZGRkZC1lZWVlZWVlZWVlZWUiLCJhdWQiOiJ4eHh4eHh4eHh4eHhleGFtcGxlIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsInRva2VuX3VzZSI6ImlkIiwiYXV0aF90aW1lIjoxNTAwMDA5NDAwLCJpc3MiOiJodHRwczovL2NvZ25pdG8taWRwLnVzLWVhc3QtMS5hbWF6b25hd3MuY29tL3VzLWVhc3QtMV9leGFtcGxlIiwiZXhwIjoxNTg0NzIzNjE2LCJnaXZlbl9uYW1lIjoiSmFuZSIsImlhdCI6MTUwMDAwOTQwMCwiZW1haWwiOiJqYW5lZG9lQGV4YW1wbGUuY29tIiwianRpIjoiZDdlMTEzM2EtMWUzYS00MjMxLWFlN2ItMjhkODVlZTBiMTRkIn0.SN5n-A3kxboNYg0sGIOipVUksCdn6xRJmAK9kSZof10"  # noqa
+        context = LambdaContext(*lambda_context_args)
+        with pytest.warns(None) as recorded_warnings:
+            new_event, new_context = authorizer.authorize(path, event, context)
+        assert event == new_event
+        assert context == new_context
+        assert len(recorded_warnings) == 1
+        warning = recorded_warnings[0]
+        assert issubclass(warning.category, UserWarning)
+        assert ('CognitoUserPoolAuthorizer for machine-to-machine '
+                'communicaiton is not supported in local mode. All requests '
+                'made against a route will be authorized to allow local '
+                'testing.') in str(warning.message)
 
 
 class TestArnBuilder(object):

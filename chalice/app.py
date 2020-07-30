@@ -8,10 +8,11 @@ import json
 import traceback
 import decimal
 import base64
+import copy
 from collections import defaultdict
 
 
-__version__ = '1.11.0'
+__version__ = '1.16.0'
 _PARAMS = re.compile(r'{\w+}')
 
 # Implementation note:  This file is intended to be a standalone file
@@ -221,9 +222,13 @@ class CaseInsensitiveMapping(Mapping):
 
 class Authorizer(object):
     name = ''
+    scopes = []
 
     def to_swagger(self):
         raise NotImplementedError("to_swagger")
+
+    def with_scopes(self, scopes):
+        raise NotImplementedError("with_scopes")
 
 
 class IAMAuthorizer(Authorizer):
@@ -232,6 +237,7 @@ class IAMAuthorizer(Authorizer):
 
     def __init__(self):
         self.name = 'sigv4'
+        self.scopes = []
 
     def to_swagger(self):
         return {
@@ -241,12 +247,16 @@ class IAMAuthorizer(Authorizer):
             'x-amazon-apigateway-authtype': 'awsSigv4',
         }
 
+    def with_scopes(self, scopes):
+        raise NotImplementedError("with_scopes")
+
 
 class CognitoUserPoolAuthorizer(Authorizer):
 
     _AUTH_TYPE = 'cognito_user_pools'
 
-    def __init__(self, name, provider_arns, header='Authorization'):
+    def __init__(self, name, provider_arns, header='Authorization',
+                 scopes=None):
         self.name = name
         self._header = header
         if not isinstance(provider_arns, list):
@@ -257,6 +267,7 @@ class CognitoUserPoolAuthorizer(Authorizer):
                 "provider_arns should be a list of ARNs, received: %s"
                 % provider_arns)
         self._provider_arns = provider_arns
+        self.scopes = scopes or []
 
     def to_swagger(self):
         return {
@@ -270,20 +281,27 @@ class CognitoUserPoolAuthorizer(Authorizer):
             }
         }
 
+    def with_scopes(self, scopes):
+        authorizer_with_scopes = copy.deepcopy(self)
+        authorizer_with_scopes.scopes = scopes
+        return authorizer_with_scopes
+
 
 class CustomAuthorizer(Authorizer):
 
     _AUTH_TYPE = 'custom'
 
     def __init__(self, name, authorizer_uri, ttl_seconds=300,
-                 header='Authorization'):
+                 header='Authorization', invoke_role_arn=None, scopes=None):
         self.name = name
         self._header = header
         self._authorizer_uri = authorizer_uri
         self._ttl_seconds = ttl_seconds
+        self._invoke_role_arn = invoke_role_arn
+        self.scopes = scopes or []
 
     def to_swagger(self):
-        return {
+        swagger = {
             'in': 'header',
             'type': 'apiKey',
             'name': self._header,
@@ -294,6 +312,15 @@ class CustomAuthorizer(Authorizer):
                 'authorizerResultTtlInSeconds': self._ttl_seconds,
             }
         }
+        if self._invoke_role_arn is not None:
+            swagger['x-amazon-apigateway-authorizer'][
+                'authorizerCredentials'] = self._invoke_role_arn
+        return swagger
+
+    def with_scopes(self, scopes):
+        authorizer_with_scopes = copy.deepcopy(self)
+        authorizer_with_scopes.scopes = scopes
+        return authorizer_with_scopes
 
 
 class CORSConfig(object):
@@ -422,14 +449,26 @@ class Response(object):
         if not isinstance(body, _ANY_STRING):
             body = json.dumps(body, separators=(',', ':'),
                               default=handle_extra_types)
+        single_headers, multi_headers = self._sort_headers(self.headers)
         response = {
-            'headers': self.headers,
+            'headers': single_headers,
+            'multiValueHeaders': multi_headers,
             'statusCode': self.status_code,
             'body': body
         }
         if binary_types is not None:
             self._b64encode_body_if_needed(response, binary_types)
         return response
+
+    def _sort_headers(self, all_headers):
+        multi_headers = {}
+        single_headers = {}
+        for name, value in all_headers.items():
+            if isinstance(value, list):
+                multi_headers[name] = value
+            else:
+                single_headers[name] = value
+        return single_headers, multi_headers
 
     def _b64encode_body_if_needed(self, response_dict, binary_types):
         response_headers = CaseInsensitiveMapping(response_dict['headers'])
@@ -507,6 +546,7 @@ class APIGateway(object):
 
     def __init__(self):
         self.binary_types = self.default_binary_types
+        self.cors = False
 
     @property
     def default_binary_types(self):
@@ -529,7 +569,7 @@ class WebsocketAPI(object):
             stage=stage,
         )
 
-    def send(self, connection_id, message):
+    def _get_client(self):
         if self.session is None:
             raise ValueError(
                 'Assign app.websocket_api.session to a boto3 session before '
@@ -545,12 +585,34 @@ class WebsocketAPI(object):
                 'apigatewaymanagementapi',
                 endpoint_url=self._endpoint,
             )
+        return self._client
+
+    def send(self, connection_id, message):
+        client = self._get_client()
         try:
-            self._client.post_to_connection(
+            client.post_to_connection(
                 ConnectionId=connection_id,
                 Data=message,
             )
-        except self._client.exceptions.GoneException:
+        except client.exceptions.GoneException:
+            raise WebsocketDisconnectedError(connection_id)
+
+    def close(self, connection_id):
+        client = self._get_client()
+        try:
+            client.delete_connection(
+                ConnectionId=connection_id,
+            )
+        except client.exceptions.GoneException:
+            raise WebsocketDisconnectedError(connection_id)
+
+    def info(self, connection_id):
+        client = self._get_client()
+        try:
+            return client.get_connection(
+                ConnectionId=connection_id,
+            )
+        except client.exceptions.GoneException:
             raise WebsocketDisconnectedError(connection_id)
 
 
@@ -697,6 +759,7 @@ class _HandlerRegistration(object):
         self.builtin_auth_handlers = []
         self.event_sources = []
         self.pure_lambda_functions = []
+        self.api = APIGateway()
 
     def _do_register_handler(self, handler_type, name, user_handler,
                              wrapped_handler, kwargs, options=None):
@@ -847,15 +910,17 @@ class _HandlerRegistration(object):
         url_prefix = kwargs.pop('url_prefix', None)
         if url_prefix is not None:
             path = '/'.join([url_prefix.rstrip('/'),
-                             path.strip('/')]).rstrip('/') or '/'
+                             path.strip('/')]).rstrip('/')
         methods = actual_kwargs.pop('methods', ['GET'])
         route_kwargs = {
             'authorizer': actual_kwargs.pop('authorizer', None),
             'api_key_required': actual_kwargs.pop('api_key_required', None),
             'content_types': actual_kwargs.pop('content_types',
                                                ['application/json']),
-            'cors': actual_kwargs.pop('cors', False),
+            'cors': actual_kwargs.pop('cors', self.api.cors),
         }
+        if route_kwargs['cors'] is None:
+            route_kwargs['cors'] = self.api.cors
         if not isinstance(route_kwargs['content_types'], list):
             raise ValueError(
                 'In view function "%s", the content_types '
@@ -886,7 +951,6 @@ class Chalice(_HandlerRegistration, DecoratorAPI):
     def __init__(self, app_name, debug=False, configure_logs=True, env=None):
         super(Chalice, self).__init__()
         self.app_name = app_name
-        self.api = APIGateway()
         self.websocket_api = WebsocketAPI()
         self.current_request = None
         self.lambda_context = None
@@ -947,7 +1011,6 @@ class Chalice(_HandlerRegistration, DecoratorAPI):
         self.log.setLevel(level)
 
     def register_blueprint(self, blueprint, name_prefix=None, url_prefix=None):
-        self._features_used.add('BLUEPRINTS')
         blueprint.register(self, options={'name_prefix': name_prefix,
                                           'url_prefix': url_prefix})
 
@@ -1144,9 +1207,10 @@ class BuiltinAuthConfig(object):
 # we would need more research to know for sure.  For now, this is a
 # special cased runtime class that knows about its config.
 class ChaliceAuthorizer(object):
-    def __init__(self, name, func):
+    def __init__(self, name, func, scopes=None):
         self.name = name
         self.func = func
+        self.scopes = scopes or []
         # This is filled in during the @app.authorizer()
         # processing.
         self.config = None
@@ -1162,6 +1226,11 @@ class ChaliceAuthorizer(object):
         return AuthRequest(event['type'],
                            event['authorizationToken'],
                            event['methodArn'])
+
+    def with_scopes(self, scopes):
+        authorizer_with_scopes = copy.deepcopy(self)
+        authorizer_with_scopes.scopes = scopes
+        return authorizer_with_scopes
 
 
 class AuthRequest(object):

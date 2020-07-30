@@ -46,6 +46,7 @@ GITIGNORE = """\
 DEFAULT_STAGE_NAME = 'dev'
 DEFAULT_APIGATEWAY_STAGE_NAME = 'api'
 DEFAULT_ENDPOINT_TYPE = 'EDGE'
+DEFAULT_TLS_VERSION = 'TLS_1_2'
 
 DEFAULT_LAMBDA_TIMEOUT = 60
 DEFAULT_LAMBDA_MEMORY_SIZE = 128
@@ -78,7 +79,7 @@ CLOUDWATCH_LOGS = {
         "logs:CreateLogStream",
         "logs:PutLogEvents"
     ],
-    "Resource": "arn:aws:logs:*:*:*"
+    "Resource": "arn:*:logs:*:*:*"
 }
 
 
@@ -113,7 +114,7 @@ CODEBUILD_POLICY = {
                 "s3:GetObjectVersion",
                 "s3:PutObject"
             ],
-            "Resource": "arn:aws:s3:::*",
+            "Resource": "arn:*:s3:::*",
             "Effect": "Allow"
         }
     ]
@@ -214,7 +215,7 @@ the chalice vendor folder.
 
 Your deployment will continue but may not work correctly
 if missing dependencies are not present. For more information:
-http://chalice.readthedocs.io/en/latest/topics/packaging.html
+http://aws.github.io/chalice/topics/packaging.html
 
 """
 
@@ -226,7 +227,7 @@ Experimental features do not guarantee backwards compatibility and may be
 removed in the future.  If you'd still like to use these experimental features,
 you can opt in by adding this to your app.py file:\n\n%s
 
-See https://chalice.readthedocs.io/en/latest/topics/experimental.html for more
+See https://aws.github.io/chalice/topics/experimental.html for more
 details.
 """
 
@@ -247,5 +248,5 @@ POST_TO_WEBSOCKET_CONNECTION_POLICY = {
     "Action": [
         "execute-api:ManageConnections"
     ],
-    "Resource": "arn:aws:execute-api:*:*:*/@connections/*"
+    "Resource": "arn:*:execute-api:*:*:*/@connections/*"
 }

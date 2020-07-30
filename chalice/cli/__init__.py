@@ -11,6 +11,7 @@ import tempfile
 import shutil
 import traceback
 import functools
+import json
 
 import botocore.exceptions
 import click
@@ -23,7 +24,7 @@ from chalice.awsclient import ReadTimeout
 from chalice.cli.factory import CLIFactory
 from chalice.cli.factory import NoSuchFunctionError
 from chalice.config import Config  # noqa
-from chalice.logs import display_logs
+from chalice.logs import display_logs, LogRetrieveOptions
 from chalice.utils import create_zip_file
 from chalice.deploy.validate import validate_routes, validate_python_version
 from chalice.deploy.validate import ExperimentalFeatureError
@@ -34,6 +35,9 @@ from chalice.constants import DEFAULT_APIGATEWAY_STAGE_NAME
 from chalice.local import LocalDevServer  # noqa
 from chalice.constants import DEFAULT_HANDLER_NAME
 from chalice.invoke import UnhandledLambdaError
+from chalice.deploy.swagger import TemplatedSwaggerGenerator
+from chalice.deploy.planner import PlanEncoder
+from chalice.deploy.appgraph import ApplicationGraphBuilder, GraphPrettyPrint
 
 
 def _configure_logging(level, format_string=None):
@@ -204,6 +208,86 @@ def deploy(ctx, autogen_policy, profile, api_gateway_stage, stage,
     reporter.display_report(deployed_values)
 
 
+@cli.group()
+def dev():
+    # type: () -> None
+    """Development and debugging commands for chalice.
+
+    All the commands under the "chalice dev" namespace are provided
+    to help chalice developers introspect the internals of chalice.
+    They are also useful for users to better understand the chalice
+    deployment process.
+
+    These commands are provided for informational purposes only.
+    There is NO guarantee of backwards compatibility for any
+    "chalice dev" commands.  Do not rely on the output of these commands.
+    These commands allow introspection of chalice internals, and the
+    internals of chalice are subject to change as needed.
+
+    """
+
+
+@dev.command()
+@click.option('--autogen-policy/--no-autogen-policy',
+              default=None,
+              help='Automatically generate IAM policy for app code.')
+@click.option('--profile', help='Override profile at deploy time.')
+@click.option('--api-gateway-stage',
+              help='Name of the API gateway stage to deploy to.')
+@click.option('--stage', default=DEFAULT_STAGE_NAME,
+              help=('Name of the Chalice stage to deploy to. '
+                    'Specifying a new chalice stage will create '
+                    'an entirely new set of AWS resources.'))
+@click.pass_context
+def plan(ctx, autogen_policy, profile, api_gateway_stage, stage):
+    # type: (click.Context, Optional[bool], str, str, str) -> None
+    """Generate and display deployment plan.
+
+    This command will calculate and pretty print the deployment plan
+    without actually executing the plan.  It's primarily used to better
+    understand the chalice deployment process.
+
+    """
+    factory = ctx.obj['factory']  # type: CLIFactory
+    factory.profile = profile
+    config = factory.create_config_obj(
+        chalice_stage_name=stage, autogen_policy=autogen_policy,
+        api_gateway_stage=api_gateway_stage,
+    )
+    session = factory.create_botocore_session()
+    ui = UI()
+    d = factory.create_plan_only_deployer(
+        session=session, config=config, ui=ui)
+    d.deploy(config, chalice_stage_name=stage)
+
+
+@dev.command()
+@click.option('--autogen-policy/--no-autogen-policy',
+              default=None,
+              help='Automatically generate IAM policy for app code.')
+@click.option('--profile', help='Override profile at deploy time.')
+@click.option('--api-gateway-stage',
+              help='Name of the API gateway stage to deploy to.')
+@click.option('--stage', default=DEFAULT_STAGE_NAME,
+              help=('Name of the Chalice stage to deploy to. '
+                    'Specifying a new chalice stage will create '
+                    'an entirely new set of AWS resources.'))
+@click.pass_context
+def appgraph(ctx, autogen_policy, profile, api_gateway_stage, stage):
+    # type: (click.Context, Optional[bool], str, str, str) -> None
+    """Generate and display the application graph."""
+    factory = ctx.obj['factory']  # type: CLIFactory
+    factory.profile = profile
+    config = factory.create_config_obj(
+        chalice_stage_name=stage, autogen_policy=autogen_policy,
+        api_gateway_stage=api_gateway_stage,
+    )
+    graph_build = ApplicationGraphBuilder()
+    graph = graph_build.build(config, stage)
+    ui = UI()
+    GraphPrettyPrint(ui).display_graph(graph)
+
+
 @cli.command('invoke')
 @click.option('-n', '--name', metavar='NAME', required=True,
               help=('The name of the function to invoke. '
@@ -219,7 +303,10 @@ def deploy(ctx, autogen_policy, profile, api_gateway_stage, stage,
 @click.pass_context
 def invoke(ctx, name, profile, stage):
     # type: (click.Context, str, str, str) -> None
-    """Invoke the deployed lambda function NAME."""
+    """Invoke the deployed lambda function NAME.
+
+    Reads payload from STDIN.
+    """
     factory = ctx.obj['factory']  # type: CLIFactory
     factory.profile = profile
 
@@ -271,14 +358,34 @@ def delete(ctx, profile, stage):
 @click.option('--include-lambda-messages/--no-include-lambda-messages',
               default=False,
               help='Controls whether or not lambda log messages are included.')
-@click.option('--stage', default=DEFAULT_STAGE_NAME)
+@click.option('--stage', default=DEFAULT_STAGE_NAME,
+              help='Name of the Chalice stage to get logs for.')
 @click.option('-n', '--name',
               help='The name of the lambda function to retrieve logs from.',
               default=DEFAULT_HANDLER_NAME)
+@click.option('-s', '--since',
+              help=('Only display logs since the provided time.  If the '
+                    '-f/--follow option is specified, then this value will '
+                    'default to 10 minutes from the current time.  Otherwise '
+                    'by default all log messages are displayed.  This value '
+                    'can either be an ISO8601 formatted timestamp or a '
+                    'relative time.  For relative times provide a number '
+                    'and a single unit.  Units can be "s" for seconds, '
+                    '"m" for minutes, "h" for hours, "d" for days, and "w" '
+                    'for weeks.  For example "5m" would indicate to display '
+                    'logs starting five minutes in the past.'),
+              default=None)
+@click.option('-f', '--follow/--no-follow',
+              default=False,
+              help=('Continuously poll for new log messages.  Note that this '
+                    'is a best effort attempt, and in certain cases can '
+                    'miss log messages.  This option is intended for '
+                    'interactive usage only.'))
 @click.option('--profile', help='The profile to use for fetching logs.')
 @click.pass_context
-def logs(ctx, num_entries, include_lambda_messages, stage, name, profile):
-    # type: (click.Context, int, bool, str, str, str) -> None
+def logs(ctx, num_entries, include_lambda_messages, stage,
+         name, since, follow, profile):
+    # type: (click.Context, int, bool, str, str, str, bool, str) -> None
     factory = ctx.obj['factory']  # type: CLIFactory
     factory.profile = profile
     config = factory.create_config_obj(stage, False)
@@ -287,9 +394,13 @@ def logs(ctx, num_entries, include_lambda_messages, stage, name, profile):
         lambda_arn = deployed.resource_values(name)['lambda_arn']
         session = factory.create_botocore_session()
         retriever = factory.create_log_retriever(
-            session, lambda_arn)
-        display_logs(retriever, num_entries, include_lambda_messages,
-                     sys.stdout)
+            session, lambda_arn, follow)
+        options = LogRetrieveOptions.create(
+            max_entries=num_entries,
+            since=since,
+            include_lambda_messages=include_lambda_messages,
+        )
+        display_logs(retriever, sys.stdout, options)
 
 
 @cli.command('gen-policy')
@@ -325,7 +436,8 @@ def new_project(project_name, profile):
 
 
 @cli.command('url')
-@click.option('--stage', default=DEFAULT_STAGE_NAME)
+@click.option('--stage', default=DEFAULT_STAGE_NAME,
+              help='Name of the Chalice stage to get the deployed URL for.')
 @click.pass_context
 def url(ctx, stage):
     # type: (click.Context, str) -> None
@@ -345,7 +457,8 @@ def url(ctx, stage):
 @cli.command('generate-sdk')
 @click.option('--sdk-type', default='javascript',
               type=click.Choice(['javascript']))
-@click.option('--stage', default=DEFAULT_STAGE_NAME)
+@click.option('--stage', default=DEFAULT_STAGE_NAME,
+              help='Name of the Chalice stage to generate an SDK for.')
 @click.argument('outdir')
 @click.pass_context
 def generate_sdk(ctx, sdk_type, stage, outdir):
@@ -367,6 +480,30 @@ def generate_sdk(ctx, sdk_type, stage, outdir):
         raise click.Abort()
 
 
+@cli.command('generate-models')
+@click.option('--stage', default=DEFAULT_STAGE_NAME,
+              help="Chalice Stage for which to generate models.")
+@click.pass_context
+def generate_models(ctx, stage):
+    # type: (click.Context, str) -> None
+    """Generate a model from Chalice routes.
+
+    Currently only supports generating Swagger 2.0 models.
+    """
+    factory = ctx.obj['factory']  # type: CLIFactory
+    config = factory.create_config_obj(stage)
+    if not config.chalice_app.routes:
+        click.echo('No REST API found to generate model from.')
+        raise click.Abort()
+    swagger_generator = TemplatedSwaggerGenerator()
+    model = swagger_generator.generate_swagger(
+        config.chalice_app,
+    )
+    ui = UI()
+    ui.write(json.dumps(model, indent=4, cls=PlanEncoder))
+    ui.write('\n')
+
+
 @cli.command('package')
 @click.option('--pkg-format', default='cloudformation',
               help=('Specify the provisioning engine to use for '
@@ -385,22 +522,36 @@ def generate_sdk(ctx, sdk_type, stage, outdir):
                     "this argument is specified, a single "
                     "zip file will be created instead. CloudFormation Only."))
 @click.option('--merge-template',
-              help=('Specify a JSON template to be merged '
+              help=('Specify a JSON or YAML template to be merged '
                     'into the generated template. This is useful '
                     'for adding resources to a Chalice template or '
                     'modify values in the template. CloudFormation Only.'))
+@click.option('--template-format', default='json',
+              type=click.Choice(['json', 'yaml'], case_sensitive=False),
+              help=('Specify if the generated template should be serialized '
+                    'as either JSON or YAML.  CloudFormation only.'))
+@click.option('--profile', help='Override profile at packaging time.')
 @click.argument('out')
 @click.pass_context
 def package(ctx, single_file, stage, merge_template,
-            out, pkg_format):
-    # type: (click.Context, bool, str, str, str, str) -> None
+            out, pkg_format, template_format, profile):
+    # type: (click.Context, bool, str, str, str, str, str, str) -> None
     factory = ctx.obj['factory']  # type: CLIFactory
+    factory.profile = profile
     config = factory.create_config_obj(stage)
-    packager = factory.create_app_packager(config, pkg_format, merge_template)
-    if pkg_format == 'terraform' and (merge_template or single_file):
+    options = factory.create_package_options()
+    packager = factory.create_app_packager(config, options,
+                                           pkg_format,
+                                           template_format,
+                                           merge_template)
+    if pkg_format == 'terraform' and (merge_template or
+                                      single_file or
+                                      template_format != 'json'):
+        # I don't see any reason we couldn't support --single-file for
+        # terraform if we wanted to.
         click.echo((
             "Terraform format does not support "
-            "merge-template or single-file options"))
+            "--merge-template, --single-file, or --template-format"))
         raise click.Abort()
 
     if single_file:

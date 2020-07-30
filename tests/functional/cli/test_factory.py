@@ -11,6 +11,7 @@ from chalice.deploy.deployer import Deployer, DeploymentReporter
 from chalice.config import Config
 from chalice.config import DeployedResources
 from chalice import local
+from chalice.package import PackageOptions
 from chalice.utils import UI
 from chalice import Chalice
 from chalice.logs import LogRetriever
@@ -103,6 +104,14 @@ def test_can_create_deletion_deployer(clifactory):
     assert isinstance(deployer, Deployer)
 
 
+def test_can_create_plan_only_deployer(clifactory):
+    session = clifactory.create_botocore_session()
+    config = clifactory.create_config_obj(chalice_stage_name='dev')
+    deployer = clifactory.create_plan_only_deployer(
+        session=session, config=config, ui=UI())
+    assert isinstance(deployer, Deployer)
+
+
 def test_can_create_config_obj(clifactory):
     obj = clifactory.create_config_obj()
     assert isinstance(obj, Config)
@@ -169,7 +178,6 @@ def test_filename_and_lineno_included_in_syntax_error(clifactory):
     # If this app has been previously imported in another app
     # we need to remove it from the cached modules to ensure
     # we get the syntax error on import.
-    sys.modules.pop('app', None)
     with pytest.raises(RuntimeError) as excinfo:
         clifactory.load_chalice_app()
     message = str(excinfo.value)
@@ -229,7 +237,18 @@ def test_can_create_log_retriever(clifactory):
     lambda_arn = (
         'arn:aws:lambda:us-west-2:1:function:app-dev-foo'
     )
-    logs = clifactory.create_log_retriever(session, lambda_arn)
+    logs = clifactory.create_log_retriever(session, lambda_arn,
+                                           follow_logs=False)
+    assert isinstance(logs, LogRetriever)
+
+
+def test_can_create_follow_logs_retriever(clifactory):
+    session = clifactory.create_botocore_session()
+    lambda_arn = (
+        'arn:aws:lambda:us-west-2:1:function:app-dev-foo'
+    )
+    logs = clifactory.create_log_retriever(session, lambda_arn,
+                                           follow_logs=True)
     assert isinstance(logs, LogRetriever)
 
 
@@ -281,3 +300,8 @@ def test_does_raise_not_found_error_when_resource_is_not_lambda(clifactory):
     with pytest.raises(factory.NoSuchFunctionError) as e:
         clifactory.create_lambda_invoke_handler('foobar', stage)
     assert e.value.name == 'foobar'
+
+
+def test_can_create_package_options(clifactory):
+    options = clifactory.create_package_options()
+    assert isinstance(options, PackageOptions)

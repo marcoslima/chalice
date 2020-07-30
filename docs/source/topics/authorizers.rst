@@ -98,6 +98,8 @@ you use the ``CustomAuthorizer`` class:
         return {"success": True}
 
 
+.. _builtin-authorizers:
+
 Built-in Authorizers
 --------------------
 
@@ -158,6 +160,8 @@ URLs as well as the principal id of the user.  You can optionally
 return a dictionary of key value pairs (as the ``context`` kwarg).
 This dictionary will be passed through on subsequent requests.
 In our example above we're not using the context dictionary.
+API Gateway will convert all the values in the ``context``
+dictionary to string values.
 
 Now let's deploy our app.  As usual, we just need to run
 ``chalice deploy`` and chalice will automatically deploy all the
@@ -221,6 +225,54 @@ For more information on custom authorizers, see the
 page in the API Gateway user guide.
 
 
+Scopes
+-------------------------
+
+OAuth 2.0 and OpenID Connect (OIDC) scopes can be used to implement access
+controls in your Chalice app. Scopes are supported when using the Cognito
+Authorizer, Custom Authorizers, and Built-In Authorizers.
+
+To integrate Scopes with a Cognito Authorizer in Chalice, you'll need to have
+an existing `Cognito user pools`_ and `Cognito resource server`_ configured.
+Scopes for Cognito Authorizers need to include the full identifier
+which is ``resourceServerIdentifier/scopeName``.
+
+Scopes can be configured per-authorizer using the ``scopes`` attribute.
+
+.. code-block:: python
+
+    from chalice import CognitoUserPoolAuthorizer
+
+    authorizer = CognitoUserPoolAuthorizer(
+        'MyPool', provider_arns=['arn:aws:cognito:...:userpool/name'],
+        scopes=["https://mychaliceapp.example.com/todos.read"])
+
+    @app.route('/user-pools', methods=['GET'], authorizer=authorizer)
+    def authenticated():
+        return {"success": True}
+
+Scopes can be configured per-route for an Authorizer using ``with_scopes``.
+
+.. code-block:: python
+
+    from chalice import CognitoUserPoolAuthorizer
+
+    authorizer = CognitoUserPoolAuthorizer(
+        'MyPool', provider_arns=['arn:aws:cognito:...:userpool/name'])
+
+    @app.route(
+        '/user-pools',
+        methods=['GET'],
+        authorizer=authorizer.with_scopes(["https://mychaliceapp.example.com/todos.read"]))
+    def authenticated():
+        return {"success": True}
+
+Scopes can also be used with custom authorizers and built-in authorizers.
+These authorizers will need to inspect the access token to determine if access
+should be granted based on the scopes configured for the authorizer and route.
+
+
 .. _IAM permissions: https://docs.aws.amazon.com/IAM/latest/UserGuide/access_controlling.html
 .. _Cognito User Pools: https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-identity-pools.html
+.. _Cognito Resource Server: https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-define-resource-servers.html
 .. _API Gateway documentation: https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-use-lambda-authorizer.html

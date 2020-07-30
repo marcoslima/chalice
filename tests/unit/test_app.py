@@ -4,6 +4,7 @@ import logging
 import json
 import gzip
 import inspect
+import collections
 from copy import deepcopy
 
 import pytest
@@ -91,15 +92,30 @@ class FakeExceptionFactory(object):
 
 
 class FakeClient(object):
-    def __init__(self, errors=None):
+    def __init__(self, errors=None, infos=None):
         if errors is None:
             errors = []
+        if infos is None:
+            infos = []
         self._errors = errors
-        self.calls = []
+        self._infos = infos
+        self.calls = collections.defaultdict(lambda: [])
         self.exceptions = FakeExceptionFactory()
 
     def post_to_connection(self, ConnectionId, Data):
-        self.calls.append((ConnectionId, Data))
+        self._call('post_to_connection', ConnectionId, Data)
+
+    def delete_connection(self, ConnectionId):
+        self._call('close', ConnectionId)
+
+    def get_connection(self, ConnectionId):
+        self._call('info', ConnectionId)
+        if self._infos is not None:
+            info = self._infos.pop()
+            return info
+
+    def _call(self, name, *args):
+        self.calls[name].append(tuple(args))
         if self._errors:
             error = self._errors.pop()
             raise error
@@ -181,6 +197,29 @@ def sample_app_with_cors():
     @demo.route('/image', methods=['POST'], cors=True,
                 content_types=['image/gif'])
     def image():
+        return {'image': True}
+
+    return demo
+
+
+@fixture
+def sample_app_with_default_cors():
+    demo = app.Chalice('demo-app')
+    demo.api.cors = True
+
+    @demo.route('/on', methods=['POST'],
+                content_types=['image/gif'])
+    def on():
+        return {'image': True}
+
+    @demo.route('/off', methods=['POST'], cors=False,
+                content_types=['image/gif'])
+    def off():
+        return {'image': True}
+
+    @demo.route('/default', methods=['POST'], cors=None,
+                content_types=['image/gif'])
+    def default():
         return {'image': True}
 
     return demo
@@ -413,6 +452,26 @@ def test_error_contains_cors_headers(sample_app_with_cors, create_event):
     assert 'Access-Control-Allow-Origin' in raw_response['headers']
 
 
+class TestDefaultCORS(object):
+    def test_cors_enabled(self, sample_app_with_default_cors, create_event):
+        event = create_event('/on', 'POST', {'not': 'image'})
+        raw_response = sample_app_with_default_cors(event, context=None)
+        assert raw_response['statusCode'] == 415
+        assert 'Access-Control-Allow-Origin' in raw_response['headers']
+
+    def test_cors_none(self, sample_app_with_default_cors, create_event):
+        event = create_event('/default', 'POST', {'not': 'image'})
+        raw_response = sample_app_with_default_cors(event, context=None)
+        assert raw_response['statusCode'] == 415
+        assert 'Access-Control-Allow-Origin' in raw_response['headers']
+
+    def test_cors_disabled(self, sample_app_with_default_cors, create_event):
+        event = create_event('/off', 'POST', {'not': 'image'})
+        raw_response = sample_app_with_default_cors(event, context=None)
+        assert raw_response['statusCode'] == 415
+        assert 'Access-Control-Allow-Origin' not in raw_response['headers']
+
+
 def test_no_view_function_found(sample_app, create_event):
     bad_path = create_event('/noexist', 'GET', {})
     with pytest.raises(app.ChaliceError):
@@ -639,13 +698,24 @@ def test_can_return_response_object(create_event):
 
     @demo.route('/index')
     def index_view():
-        return app.Response(status_code=200, body={'foo': 'bar'},
-                            headers={'Content-Type': 'application/json'})
+        return app.Response(
+            status_code=200,
+            body={'foo': 'bar'},
+            headers={
+                'Content-Type': 'application/json',
+                'Set-Cookie': ['key=value', 'foo=bar'],
+            },
+        )
 
     event = create_event('/index', 'GET', {})
     response = demo(event, context=None)
-    assert response == {'statusCode': 200, 'body': '{"foo":"bar"}',
-                        'headers': {'Content-Type': 'application/json'}}
+    assert response == {
+        'statusCode': 200,
+        'body': '{"foo":"bar"}',
+
+        'headers': {'Content-Type': 'application/json'},
+        'multiValueHeaders': {'Set-Cookie': ['key=value', 'foo=bar']},
+    }
 
 
 def test_headers_have_basic_validation(create_event):
@@ -858,7 +928,7 @@ def test_unknown_kwargs_raise_error(sample_app, create_event):
             pass
 
 
-def test_name_kwargs_does_not_raise_error(sample_app, create_event):
+def test_name_kwargs_does_not_raise_error(sample_app):
     try:
         @sample_app.route('/foo', name='foo')
         def name_kwarg():
@@ -986,7 +1056,8 @@ def test_typecheck_list_type():
 
 def test_can_serialize_custom_authorizer():
     auth = app.CustomAuthorizer(
-        'Name', 'myuri', ttl_seconds=10, header='NotAuth'
+        'Name', 'myuri', ttl_seconds=10, header='NotAuth',
+        invoke_role_arn='role-arn'
     )
     assert auth.to_swagger() == {
         'in': 'header',
@@ -997,6 +1068,7 @@ def test_can_serialize_custom_authorizer():
             'type': 'token',
             'authorizerUri': 'myuri',
             'authorizerResultTtlInSeconds': 10,
+            'authorizerCredentials': 'role-arn',
         }
     }
 
@@ -1863,6 +1935,28 @@ def test_can_mount_apis_at_url_prefix():
     assert list(sorted(myapp.routes)) == ['/myprefix/bar', '/myprefix/foo']
 
 
+def test_can_mount_root_url_in_blueprint():
+    myapp = app.Chalice('myapp')
+    foo = app.Blueprint('foo')
+    root = app.Blueprint('root')
+
+    @root.route('/')
+    def myroot():
+        pass
+
+    @foo.route('/')
+    def myfoo():
+        pass
+
+    @foo.route('/bar')
+    def mybar():
+        pass
+
+    myapp.register_blueprint(foo, url_prefix='/foo')
+    myapp.register_blueprint(root)
+    assert list(sorted(myapp.routes)) == ['/', '/foo', '/foo/bar']
+
+
 def test_can_combine_lambda_functions_and_routes_in_blueprints():
     myapp = app.Chalice('myapp')
 
@@ -2007,19 +2101,6 @@ def test_every_decorator_added_to_blueprint():
     ]
     for method_name, _ in public_api:
         assert method_name in blueprint_api
-
-
-def test_blueprint_gated_behind_feature_flag():
-    # Blueprints won't validate unless you enable their feature flag.
-    myapp = app.Chalice('myapp')
-    bp = app.Blueprint('app.chalicelib.blueprints.foo')
-
-    @bp.route('/')
-    def index():
-        pass
-
-    myapp.register_blueprint(bp)
-    assert_requires_opt_in(myapp, flag='BLUEPRINTS')
 
 
 @pytest.mark.parametrize('input_dict', [
@@ -2352,6 +2433,92 @@ def test_cannot_send_websocket_message_without_configure(
     )
 
 
+def test_can_close_websocket_connection(create_websocket_event):
+    demo = app.Chalice('app-name')
+    client = FakeClient()
+    demo.websocket_api.session = FakeSession(client)
+
+    @demo.on_ws_message()
+    def message_handler(event):
+        demo.websocket_api.close('connection_id')
+
+    event = create_websocket_event('$default', body='foo bar')
+    handler = websocket_handler_for_route('$default', demo)
+    handler(event, context=None)
+
+    calls = client.calls['close']
+    assert len(calls) == 1
+    call = calls[0]
+    connection_id = call[0]
+    assert connection_id == 'connection_id'
+
+
+def test_close_does_fail_if_already_disconnected(create_websocket_event):
+    demo = app.Chalice('app-name')
+    client = FakeClient(errors=[FakeGoneException])
+    demo.websocket_api.session = FakeSession(client)
+
+    @demo.on_ws_message()
+    def message_handler(event):
+        with pytest.raises(WebsocketDisconnectedError) as e:
+            demo.websocket_api.close('connection_id')
+        assert e.value.connection_id == 'connection_id'
+
+    event = create_websocket_event('$default', body='foo bar')
+    handler = websocket_handler_for_route('$default', demo)
+    handler(event, context=None)
+
+    calls = client.calls['close']
+    assert len(calls) == 1
+    call = calls[0]
+    connection_id = call[0]
+    assert connection_id == 'connection_id'
+
+
+def test_info_does_fail_if_already_disconnected(create_websocket_event):
+    demo = app.Chalice('app-name')
+    client = FakeClient(errors=[FakeGoneException])
+    demo.websocket_api.session = FakeSession(client)
+
+    @demo.on_ws_message()
+    def message_handler(event):
+        with pytest.raises(WebsocketDisconnectedError) as e:
+            demo.websocket_api.info('connection_id')
+        assert e.value.connection_id == 'connection_id'
+
+    event = create_websocket_event('$default', body='foo bar')
+    handler = websocket_handler_for_route('$default', demo)
+    handler(event, context=None)
+
+    calls = client.calls['info']
+    assert len(calls) == 1
+    call = calls[0]
+    connection_id = call[0]
+    assert connection_id == 'connection_id'
+
+
+def test_can__about_websocket_connection(create_websocket_event):
+    demo = app.Chalice('app-name')
+    client = FakeClient(infos=[{'foo': 'bar'}])
+    demo.websocket_api.session = FakeSession(client)
+    closure = {}
+
+    @demo.on_ws_message()
+    def message_handler(event):
+        closure['info'] = demo.websocket_api.info('connection_id')
+
+    event = create_websocket_event('$default', body='foo bar')
+    handler = websocket_handler_for_route('$default', demo)
+    handler(event, context=None)
+
+    assert closure['info'] == {'foo': 'bar'}
+    calls = client.calls['info']
+    assert len(calls) == 1
+    call = calls[0]
+    connection_id = call[0]
+    assert connection_id == 'connection_id'
+
+
 def test_can_send_websocket_message(create_websocket_event):
     demo = app.Chalice('app-name')
     client = FakeClient()
@@ -2365,8 +2532,9 @@ def test_can_send_websocket_message(create_websocket_event):
     handler = websocket_handler_for_route('$default', demo)
     handler(event, context=None)
 
-    assert len(client.calls) == 1
-    call = client.calls[0]
+    calls = client.calls['post_to_connection']
+    assert len(calls) == 1
+    call = calls[0]
     connection_id, message = call
     assert connection_id == 'connection_id'
     assert message == 'foo bar'

@@ -130,6 +130,18 @@ class TestPackage(object):
         pkg = Package('', 'foo.bar-2.0-py3-none-any.whl')
         assert pkg.identifier == 'foo-bar==2.0'
 
+    def test_can_normalize_data_dir(self):
+        pkg = Package('', 'Foobar-2.0-py3-none-any.whl')
+        assert pkg.data_dir == 'foobar-2.0.data'
+
+    def test_can_normalize_dirname_comparisons(self):
+        pkg = Package('', 'Foobar-2.0-py3-none-any.whl')
+        assert pkg.matches_data_dir('Foobar-2.0.data')
+        assert pkg.matches_data_dir('foobar-2.0.data')
+        assert not pkg.matches_data_dir('other-2.0.data')
+        assert not pkg.matches_data_dir('foobar-2.0.datastuff')
+        assert not pkg.matches_data_dir('foobar-2.0')
+
 
 class TestPipRunner(object):
     def test_does_propagate_env_vars(self, pip_factory):
@@ -186,6 +198,17 @@ class TestPipRunner(object):
                              'requirements.txt', '--dest', 'directory']
         assert call.env_vars is None
         assert call.shim is None
+
+    def test_download_sdist(self, pip_factory):
+        pip, runner = pip_factory()
+        packages = ['foo', 'bar', 'baz']
+        runner.download_sdists(packages, 'directory')
+        expected_prefix = ['download', '--no-binary=:all:', '--no-deps',
+                           '--dest', 'directory']
+        for i, package in enumerate(packages):
+            assert pip.calls[i].args == expected_prefix + [package]
+            assert pip.calls[i].env_vars is None
+            assert pip.calls[i].shim is None
 
     def test_download_wheels(self, pip_factory):
         # Make sure that `pip download` is called with the correct arguments

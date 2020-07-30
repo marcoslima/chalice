@@ -194,7 +194,7 @@ We'll update the ``app.py`` file to use the ``on_sns_message`` decorator:
 
     from chalice import Chalice
 
-    app = chalice.Chalice(app_name='chalice-sns-demo')
+    app = Chalice(app_name='chalice-sns-demo')
     app.debug = True
 
     @app.on_sns_message(topic='my-demo-topic')
@@ -304,12 +304,11 @@ of our ``handle_sqs_message`` lambda function to 30 seconds::
   }
 
 
-.. note::
-
-    FIFO SQS queues are not currently supported.
-
 In this example below, we're connecting the ``handle_sqs_message`` lambda
-function to the ``my-queue`` SQS queue.
+function to the ``my-queue`` SQS queue.  Note that we are specifying the
+queue name, not the queue URL or queue ARN.  If you are connecting your
+lambda function to a FIFO queue, make sure you specify the ``.fifo``
+suffix, e.g. ``my-queue.fifo``.
 
 .. code-block:: python
 
@@ -321,7 +320,7 @@ function to the ``my-queue`` SQS queue.
     @app.on_sqs_message(queue='my-queue', batch_size=1)
     def handle_sqs_message(event):
         for record in event:
-            app.log.debug("Received message with contents: ", record.body)
+            app.log.debug("Received message with contents: %s", record.body)
 
 
 Whenever a message is sent to the SQS queue our function will be automatically

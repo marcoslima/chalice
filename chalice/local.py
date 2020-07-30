@@ -12,15 +12,25 @@ import base64
 import functools
 import warnings
 from collections import namedtuple
+import json
 
 from six.moves.BaseHTTPServer import HTTPServer
 from six.moves.BaseHTTPServer import BaseHTTPRequestHandler
 from six.moves.socketserver import ThreadingMixIn
-from typing import List, Any, Dict, Tuple, Callable, Optional, Union  # noqa
+from typing import (
+    List,
+    Any,
+    Dict,
+    Tuple,
+    Callable,
+    Optional,
+    Union,
+)  # noqa
 
 from chalice.app import Chalice  # noqa
 from chalice.app import CORSConfig  # noqa
 from chalice.app import ChaliceAuthorizer  # noqa
+from chalice.app import CognitoUserPoolAuthorizer  # noqa
 from chalice.app import RouteEntry  # noqa
 from chalice.app import Request  # noqa
 from chalice.app import AuthResponse  # noqa
@@ -47,6 +57,7 @@ class Clock(object):
 
 def create_local_server(app_obj, config, host, port):
     # type: (Chalice, Config, str, int) -> LocalDevServer
+    app_obj.__class__ = LocalChalice
     return LocalDevServer(app_obj, config, host, port)
 
 
@@ -302,6 +313,35 @@ class LocalGatewayAuthorizer(object):
         authorizer = route_entry.authorizer
         if not authorizer:
             return lambda_event, lambda_context
+        # If authorizer is Cognito then try to parse the JWT and simulate an
+        # APIGateway validated request
+        if isinstance(authorizer, CognitoUserPoolAuthorizer):
+            if "headers" in lambda_event\
+                    and "authorization" in lambda_event["headers"]:
+                token = lambda_event["headers"]["authorization"]
+                claims = self._decode_jwt_payload(token)
+
+                try:
+                    cognito_username = claims["cognito:username"]
+                except KeyError:
+                    # If a key error is raised when trying to get the cognito
+                    # username then it is a machine-to-machine communication.
+                    # This kind of cognito authorization flow is not
+                    # supported in local mode. We can ignore it here to allow
+                    # users to test their code local with a different cognito
+                    # authorization flow.
+                    warnings.warn(
+                        '%s for machine-to-machine communicaiton is not '
+                        'supported in local mode. All requests made against '
+                        'a route will be authorized to allow local testing.'
+                        % authorizer.__class__.__name__
+                    )
+                    return lambda_event, lambda_context
+
+                auth_result = {"context": {"claims": claims},
+                               "principalId": cognito_username}
+                lambda_event = self._update_lambda_event(lambda_event,
+                                                         auth_result)
         if not isinstance(authorizer, ChaliceAuthorizer):
             # Currently the only supported local authorizer is the
             # BuiltinAuthConfig type. Anything else we will err on the side of
@@ -390,6 +430,19 @@ class LocalGatewayAuthorizer(object):
         authorizer_event['methodArn'] = arn
         return authorizer_event
 
+    def _decode_jwt_payload(self, jwt):
+        # type: (str) -> Dict
+        payload_segment = jwt.split(".", 2)[1]
+        payload = base64.urlsafe_b64decode(self._base64_pad(payload_segment))
+        return json.loads(payload)
+
+    def _base64_pad(self, value):
+        # type: (str) -> str
+        rem = len(value) % 4
+        if rem > 0:
+            value += "=" * (4 - rem)
+        return value
+
 
 class LocalGateway(object):
     """A class for faking the behavior of API Gateway."""
@@ -474,6 +527,7 @@ class LocalGateway(object):
             return {
                 'statusCode': 200,
                 'headers': options_headers,
+                'multiValueHeaders': {},
                 'body': None
             }
         # The authorizer call will be a noop if there is no authorizer method
@@ -536,9 +590,7 @@ class ChaliceRequestHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get('content-length', '0'))
         if content_length > 0:
             body = self.rfile.read(content_length)
-        # mypy doesn't like dict(self.headers) so I had to use a
-        # dictcomp instead to make it happy.
-        converted_headers = {key: value for key, value in self.headers.items()}
+        converted_headers = dict(self.headers)
         return converted_headers, body
 
     def _generic_handle(self):
@@ -552,7 +604,8 @@ class ChaliceRequestHandler(BaseHTTPRequestHandler):
                 body=body
             )
             status_code = response['statusCode']
-            headers = response['headers']
+            headers = response['headers'].copy()
+            headers.update(response['multiValueHeaders'])
             body = response['body']
             self._send_http_response(status_code, headers, body)
         except LocalGatewayException as e:
@@ -581,9 +634,7 @@ class ChaliceRequestHandler(BaseHTTPRequestHandler):
         content_type = headers.pop(
             'Content-Type', 'application/json')
         self.send_header('Content-Type', content_type)
-        for header_name, header_value in headers.items():
-            self.send_header(header_name, header_value)
-        self.end_headers()
+        self._send_headers(headers)
         self.wfile.write(body)
 
     do_GET = do_PUT = do_POST = do_HEAD = do_DELETE = do_PATCH = do_OPTIONS = \
@@ -593,8 +644,16 @@ class ChaliceRequestHandler(BaseHTTPRequestHandler):
         # type: (int, HeaderType) -> None
         headers['Content-Length'] = '0'
         self.send_response(code)
-        for k, v in headers.items():
-            self.send_header(k, v)
+        self._send_headers(headers)
+
+    def _send_headers(self, headers):
+        # type: (HeaderType) -> None
+        for header_name, header_value in headers.items():
+            if isinstance(header_value, list):
+                for value in header_value:
+                    self.send_header(header_name, value)
+            else:
+                self.send_header(header_name, header_value)
         self.end_headers()
 
 
@@ -663,3 +722,23 @@ class HTTPServerThread(threading.Thread):
         # type: () -> None
         if self._server is not None:
             self._server.shutdown()
+
+
+class LocalChalice(Chalice):
+
+    _THREAD_LOCAL = threading.local()
+
+    # This is a known mypy bug where you can't override instance
+    # variables with properties.  So this should be type safe, which
+    # is why we're adding the type: ignore comments here.
+    # See: https://github.com/python/mypy/issues/4125
+
+    @property  # type: ignore
+    def current_request(self):  # type: ignore
+        # type: () -> Request
+        return self._THREAD_LOCAL.current_request
+
+    @current_request.setter
+    def current_request(self, value):  # type: ignore
+        # type: (Request) -> None
+        self._THREAD_LOCAL.current_request = value

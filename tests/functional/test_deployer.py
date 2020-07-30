@@ -2,6 +2,7 @@ import os
 import zipfile
 import json
 import mock
+import hashlib
 
 from pytest import fixture
 import pytest
@@ -18,9 +19,7 @@ from chalice.deploy.packager import DependencyBuilder
 from chalice.deploy.packager import Package
 
 
-slow = pytest.mark.skipif(
-    pytest.config.getoption('--skip-slow'),
-    reason='Skipped due to --skip-slow')
+slow = pytest.mark.slow
 
 
 @fixture
@@ -74,6 +73,30 @@ def test_can_inject_latest_app(tmpdir, chalice_deployer):
     with zipfile.ZipFile(name) as f:
         contents = f.read('app.py')
         assert contents == b'# Test app NEW VERSION'
+
+
+@slow
+def test_zipfile_hash_only_based_on_contents(tmpdir, chalice_deployer):
+    appdir = _create_app_structure(tmpdir)
+    appdir.join('app.py').write('# Test app v1')
+    name = chalice_deployer.create_deployment_package(
+        str(appdir), 'python2.7')
+    with open(name, 'rb') as f:
+        original_checksum = hashlib.md5(f.read()).hexdigest()
+
+    # Now we'll modify the file our app file with the same contents
+    # but it will change the mtime.
+    app_file = appdir.join('app.py')
+    app_file.write('# Test app v1')
+    # Set the mtime to something different (1990-1-1T00:00:00).
+    # This would normally result in the zipfile having a different
+    # checksum.
+    os.utime(str(app_file), (631152000.0, 631152000.0))
+    name = chalice_deployer.create_deployment_package(
+        str(appdir), 'python2.7')
+    with open(name, 'rb') as f:
+        new_checksum = hashlib.md5(f.read()).hexdigest()
+    assert new_checksum == original_checksum
 
 
 @slow
@@ -200,11 +223,57 @@ def test_subsequent_deploy_replaces_vendor_dir(tmpdir, chalice_deployer):
         _assert_in_zip('mypackage/__init__.py', b'# v2', f)
 
 
+@slow
+def test_vendor_symlink_included(tmpdir, chalice_deployer):
+    appdir = _create_app_structure(tmpdir)
+    extra_package = tmpdir.mkdir('mypackage')
+    extra_package.join('__init__.py').write('# Test package')
+    vendor = appdir.mkdir('vendor')
+    os.symlink(str(extra_package), str(vendor.join('otherpackage')))
+    name = chalice_deployer.create_deployment_package(
+        str(appdir), 'python2.7')
+    with zipfile.ZipFile(name) as f:
+        _assert_in_zip('otherpackage/__init__.py', b'# Test package', f)
+
+
+@slow
+def test_subsequent_deploy_replaces_vendor_symlink(tmpdir, chalice_deployer):
+    appdir = _create_app_structure(tmpdir)
+    extra_package = tmpdir.mkdir('mypackage')
+    extra_package.join('__init__.py').write('# v1')
+    vendor = appdir.mkdir('vendor')
+    os.symlink(str(extra_package), str(vendor.join('otherpackage')))
+    name = chalice_deployer.create_deployment_package(
+        str(appdir), 'python2.7')
+    with zipfile.ZipFile(name) as f:
+        _assert_in_zip('otherpackage/__init__.py', b'# v1', f)
+    # Now we update a package in vendor/ with a new version.
+    extra_package.join('__init__.py').write('# v2')
+    name = chalice_deployer.create_deployment_package(
+        str(appdir), 'python2.7')
+    with zipfile.ZipFile(name) as f:
+        _assert_in_zip('otherpackage/__init__.py', b'# v2', f)
+
+
 def test_zip_filename_changes_on_vendor_update(tmpdir, chalice_deployer):
     appdir = _create_app_structure(tmpdir)
     vendor = appdir.mkdir('vendor')
     extra_package = vendor.mkdir('mypackage')
     extra_package.join('__init__.py').write('# v1')
+    first = chalice_deployer.deployment_package_filename(
+        str(appdir), 'python3.6')
+    extra_package.join('__init__.py').write('# v2')
+    second = chalice_deployer.deployment_package_filename(
+        str(appdir), 'python3.6')
+    assert first != second
+
+
+def test_zip_filename_changes_on_vendor_symlink(tmpdir, chalice_deployer):
+    appdir = _create_app_structure(tmpdir)
+    vendor = appdir.mkdir('vendor')
+    extra_package = tmpdir.mkdir('mypackage')
+    extra_package.join('__init__.py').write('# v1')
+    os.symlink(str(extra_package), str(vendor.join('otherpackage')))
     first = chalice_deployer.deployment_package_filename(
         str(appdir), 'python3.6')
     extra_package.join('__init__.py').write('# v2')

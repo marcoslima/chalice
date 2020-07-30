@@ -371,8 +371,10 @@ def test_can_load_python_version():
         expected_runtime = 'python2.7'
     elif minor <= 6:
         expected_runtime = 'python3.6'
-    else:
+    elif minor <= 7:
         expected_runtime = 'python3.7'
+    else:
+        expected_runtime = 'python3.8'
     assert c.lambda_python_version == expected_runtime
 
 
@@ -568,6 +570,35 @@ def test_deployed_resource_does_not_exist():
     )
     with pytest.raises(ValueError):
         deployed.resource_values('bar')
+
+
+def test_deployed_api_mapping_resource():
+    deployed = DeployedResources(
+        {'resources': [
+            {'name': 'foo'},
+            {
+                "name": "api_gateway_custom_domain",
+                "resource_type": "domain_name",
+                "api_mapping": [
+                    {
+                        "key": "path_key"
+                    }
+                ]
+            }
+        ]}
+    )
+
+    name = 'api_gateway_custom_domain.api_mapping.path_key'
+    result = deployed.resource_values(name)
+    assert result == {
+        "name": "api_gateway_custom_domain",
+        "resource_type": "domain_name",
+        "api_mapping": [
+            {
+                "key": "path_key"
+            }
+        ]
+    }
 
 
 def test_deployed_resource_exists():

@@ -15,7 +15,7 @@ from chalice.config import Config, DeployedResources
 from chalice.utils import record_deployed_values
 from chalice.utils import PipeReader
 from chalice.constants import DEFAULT_APIGATEWAY_STAGE_NAME
-from chalice.logs import LogRetriever
+from chalice.logs import LogRetriever, LogRetrieveOptions
 from chalice.invoke import LambdaInvokeHandler
 from chalice.invoke import UnhandledLambdaError
 from chalice.awsclient import ReadTimeout
@@ -41,6 +41,10 @@ def mock_cli_factory():
     cli_factory.create_config_obj.return_value = Config.create(project_dir='.')
     cli_factory.create_botocore_session.return_value = mock.sentinel.Session
     return cli_factory
+
+
+def teardown_function(function):
+    sys.modules.pop('app', None)
 
 
 def assert_chalice_app_structure_created(dirname):
@@ -128,7 +132,103 @@ def test_gen_policy_command_creates_policy(runner):
         assert 'Statement' in parsed_policy
 
 
-def test_can_package_command(runner):
+def test_does_fail_to_generate_swagger_if_no_rest_api(runner):
+    with runner.isolated_filesystem():
+        cli.create_new_project_skeleton('testproject')
+        os.chdir('testproject')
+        with open('app.py', 'w') as f:
+            f.write(
+                'from chalice import Chalice\n'
+                'app = Chalice("myapp")\n'
+            )
+        result = _run_cli_command(runner, cli.generate_models, [])
+        assert result.exit_code == 1
+        assert result.output == (
+            'No REST API found to generate model from.\n'
+            'Aborted!\n'
+        )
+
+
+def test_can_write_swagger_model(runner):
+    with runner.isolated_filesystem():
+        cli.create_new_project_skeleton('testproject')
+        os.chdir('testproject')
+        result = _run_cli_command(runner, cli.generate_models, [])
+        assert result.exit_code == 0
+        model = json.loads(result.output)
+        assert model == {
+            "swagger": "2.0",
+            "info": {
+                "version": "1.0",
+                "title": "testproject"
+            },
+            "schemes": [
+                "https"
+            ],
+            "paths": {
+                "/": {
+                    "get": {
+                        "consumes": [
+                            "application/json"
+                        ],
+                        "produces": [
+                            "application/json"
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "200 response",
+                                "schema": {
+                                    "$ref": "#/definitions/Empty"
+                                }
+                            }
+                        },
+                        "x-amazon-apigateway-integration": {
+                            "responses": {
+                                "default": {
+                                    "statusCode": "200"
+                                }
+                            },
+                            "uri": (
+                                "arn:{partition}:apigateway:{region_name}"
+                                ":lambda:path/2015-03-31/functions/"
+                                "{api_handler_lambda_arn}/invocations"
+                            ),
+                            "passthroughBehavior": "when_no_match",
+                            "httpMethod": "POST",
+                            "contentHandling": "CONVERT_TO_TEXT",
+                            "type": "aws_proxy"
+                        }
+                    }
+                }
+            },
+            "definitions": {
+                "Empty": {
+                    "type": "object",
+                    "title": "Empty Schema"
+                }
+            },
+            "x-amazon-apigateway-binary-media-types": [
+                "application/octet-stream",
+                "application/x-tar",
+                "application/zip",
+                "audio/basic",
+                "audio/ogg",
+                "audio/mp4",
+                "audio/mpeg",
+                "audio/wav",
+                "audio/webm",
+                "image/png",
+                "image/jpg",
+                "image/jpeg",
+                "image/gif",
+                "video/ogg",
+                "video/mpeg",
+                "video/webm"
+            ]
+        }
+
+
+def test_can_package_command(runner, mock_cli_factory):
     with runner.isolated_filesystem():
         cli.create_new_project_skeleton('testproject')
         os.chdir('testproject')
@@ -138,6 +238,30 @@ def test_can_package_command(runner):
         dir_contents = os.listdir('outdir')
         assert 'sam.json' in dir_contents
         assert 'deployment.zip' in dir_contents
+
+
+def test_can_package_with_yaml_command(runner):
+    with runner.isolated_filesystem():
+        cli.create_new_project_skeleton('testproject')
+        os.chdir('testproject')
+        result = _run_cli_command(runner, cli.package,
+                                  ['--template-format', 'yaml', 'outdir'])
+        assert result.exit_code == 0, result.output
+        assert os.path.isdir('outdir')
+        dir_contents = os.listdir('outdir')
+        assert 'sam.yaml' in dir_contents
+        assert 'deployment.zip' in dir_contents
+
+
+def test_case_insensitive_template_format(runner):
+    with runner.isolated_filesystem():
+        cli.create_new_project_skeleton('testproject')
+        os.chdir('testproject')
+        result = _run_cli_command(runner, cli.package,
+                                  ['--template-format', 'YAML', 'outdir'])
+        assert result.exit_code == 0, result.output
+        assert os.path.isdir('outdir')
+        assert 'sam.yaml' in os.listdir('outdir')
 
 
 def test_can_package_with_single_file(runner):
@@ -278,6 +402,8 @@ def test_error_when_no_deployed_record(runner, mock_cli_factory):
 
 @pytest.mark.skipif(sys.version_info[:2] == (3, 7),
                     reason="Cannot generate pipeline for python3.7.")
+@pytest.mark.skipif(sys.version_info[:2] == (3, 8),
+                    reason="Cannot generate pipeline for python3.8.")
 def test_can_generate_pipeline_for_all(runner):
     with runner.isolated_filesystem():
         cli.create_new_project_skeleton('testproject')
@@ -383,9 +509,40 @@ def test_can_provide_lambda_name_for_logs(runner, mock_cli_factory):
         )
         assert result.exit_code == 0
     log_retriever.retrieve_logs.assert_called_with(
-        include_lambda_messages=False, max_entries=None)
+        LogRetrieveOptions(
+            include_lambda_messages=False, max_entries=None)
+    )
     mock_cli_factory.create_log_retriever.assert_called_with(
-        mock.sentinel.Session, 'arn:aws:lambda::app-dev-foo'
+        mock.sentinel.Session, 'arn:aws:lambda::app-dev-foo', False
+    )
+
+
+def test_can_follow_logs_with_option(runner, mock_cli_factory):
+    deployed_resources = DeployedResources({
+        "resources": [
+            {"name": "foo",
+             "lambda_arn": "arn:aws:lambda::app-dev-foo",
+             "resource_type": "lambda_function"}]
+    })
+    mock_cli_factory.create_config_obj.return_value = FakeConfig(
+        deployed_resources)
+    log_retriever = mock.Mock(spec=LogRetriever)
+    log_retriever.retrieve_logs.return_value = []
+    mock_cli_factory.create_log_retriever.return_value = log_retriever
+    with runner.isolated_filesystem():
+        cli.create_new_project_skeleton('testproject')
+        os.chdir('testproject')
+        result = _run_cli_command(
+            runner, cli.logs, ['--name', 'foo', '--follow'],
+            cli_factory=mock_cli_factory
+        )
+        assert result.exit_code == 0
+    log_retriever.retrieve_logs.assert_called_with(
+        LogRetrieveOptions(
+            include_lambda_messages=False, max_entries=None)
+    )
+    mock_cli_factory.create_log_retriever.assert_called_with(
+        mock.sentinel.Session, 'arn:aws:lambda::app-dev-foo', True
     )
 
 
@@ -483,7 +640,6 @@ def test_invoke_does_raise_if_no_function_found(runner, mock_cli_factory):
 def test_error_message_displayed_when_missing_feature_opt_in(runner):
     with runner.isolated_filesystem():
         cli.create_new_project_skeleton('testproject')
-        sys.modules.pop('app', None)
         with open(os.path.join('testproject', 'app.py'), 'w') as f:
             # Rather than pick an existing experimental feature, we're
             # manually injecting a feature flag into our app.  This ensures
@@ -520,3 +676,34 @@ def test_cli_with_absolute_path(runner, path):
         assert result.exit_code == 0
         assert os.listdir(os.getcwd()) == ['testproject']
         assert_chalice_app_structure_created(dirname='testproject')
+
+
+def test_can_generate_dev_plan(runner, mock_cli_factory):
+    with runner.isolated_filesystem():
+        cli.create_new_project_skeleton('testproject')
+        os.chdir('testproject')
+        result = _run_cli_command(runner, cli.plan, [],
+                                  cli_factory=mock_cli_factory)
+        deployer = mock_cli_factory.create_plan_only_deployer.return_value
+        call_args = deployer.deploy.call_args
+        assert result.exit_code == 0
+        assert isinstance(call_args[0][0], Config)
+        assert call_args[1] == {'chalice_stage_name': 'dev'}
+
+
+# The appgraph command actually works on py27, but due to a bug in click's
+# testing (https://github.com/pallets/click/issues/848), it assumes
+# stdout must be ascii.
+# stdout is a cStringIO.StringIO, which doesn't accept unicode.
+# See: https://docs.python.org/2/library/stringio.html#cStringIO.StringIO
+@pytest.mark.skipif(sys.version_info[0] == 2,
+                    reason="Click bug when writing unicode to stdout.")
+def test_can_generate_appgraph(runner, mock_cli_factory):
+    with runner.isolated_filesystem():
+        cli.create_new_project_skeleton('testproject')
+        os.chdir('testproject')
+        result = _run_cli_command(runner, cli.appgraph, [])
+        assert result.exit_code == 0
+        # Just sanity checking some of the output
+        assert 'Application' in result.output
+        assert 'RestAPI(' in result.output

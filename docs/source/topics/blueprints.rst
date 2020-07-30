@@ -2,21 +2,6 @@ Blueprints
 ==========
 
 
-.. warning::
-
-  Blueprints are considered an experimental API.  You'll need to opt-in
-  to this feature using the ``BLUEPRINTS`` feature flag:
-
-  .. code-block:: python
-
-    app = Chalice('myapp')
-    app.experimental_feature_flags.update([
-        'BLUEPRINTS'
-    ])
-
-  See :doc:`experimental` for more information.
-
-
 Chalice blueprints are used to organize your application into logical
 components.  Using a blueprint, you define your resources and decorators in
 modules outside of your ``app.py``.  You then register a blueprint in your main
@@ -27,7 +12,7 @@ object.
 .. note::
 
   The Chalice blueprints are conceptually similar to `Blueprints
-  <http://flask.pocoo.org/docs/latest/blueprints/>`__ in Flask.  Flask
+  <https://flask.palletsprojects.com/blueprints/>`__ in Flask.  Flask
   blueprints allow you to define a set of URL routes separately from the main
   ``Flask`` object.  This concept is extended to all resources in Chalice.  A
   Chalice blueprint can have Lambda functions, event handlers, built-in
@@ -73,9 +58,6 @@ imported when running in Lambda.  We'll now import this module in our
     from chalicelib.blueprints import extra_routes
 
     app = Chalice(app_name='blueprint-demo')
-    app.experimental_feature_flags.update([
-        'BLUEPRINTS'
-    ])
     app.register_blueprint(extra_routes)
 
 
@@ -215,9 +197,6 @@ In our ``app.py`` we'll register these blueprints:
     from chalicelib.api import myapi
 
     app = Chalice(app_name='blueprint-demo')
-    app.experimental_feature_flags.update([
-        'BLUEPRINTS'
-    ])
     app.register_blueprint(myevents)
     app.register_blueprint(myapi)
 

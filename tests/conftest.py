@@ -1,14 +1,37 @@
-import zipfile
-from collections import namedtuple
+import sys
 
 import botocore.session
 from botocore.stub import Stubber
+import pytest
 from pytest import fixture
 
 
 def pytest_addoption(parser):
     parser.addoption('--skip-slow', action='store_true',
                      help='Skip slow tests')
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: mark test as slow to run")
+    config.addinivalue_line(
+        "markers", (
+            "on_redeploy: mark an integration test to be run after "
+            "the app is redeployed"
+        )
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--skip-slow"):
+        skip_slow = pytest.mark.skip(reason="Skipping due to --skip-slow")
+        for item in items:
+            if "slow" in item.keywords:
+                item.add_marker(skip_slow)
+
+
+@fixture(autouse=True)
+def teardown_function():
+    sys.modules.pop('app', None)
 
 
 class StubbedSession(botocore.session.Session):
@@ -109,7 +132,7 @@ class ChaliceStubber(Stubber):
         """Adds a custom exception to the response queue
 
         :type method: str
-        :param method: Thhe name of the service method to raise the error
+        :param method: The name of the service method to raise the error
             on.
 
         :type error: Exception

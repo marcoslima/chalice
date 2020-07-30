@@ -101,13 +101,13 @@ Chalice
         the method required a valid API key.
 
       :param cors: Specify if CORS is supported for this view.  This can either
-        by a boolean value or an instance of :class:`CORSConfig`.  Setting this
-        value is set to ``True`` gives similar behavior to enabling CORS in the
-        AWS Console.  This includes injecting the
+        by a boolean value, ``None``, or an instance of :class:`CORSConfig`.
+        Setting this value is set to ``True`` gives similar behavior to enabling
+        CORS in the AWS Console.  This includes injecting the
         ``Access-Control-Allow-Origin`` header to have a value of ``*`` as well
         as adding an ``OPTIONS`` method to support preflighting requests.  If
-        you would like more control over how CORS is configured, you can
-        provide an instance of :class:`CORSConfig`.
+        you would like more control over how CORS is configured, you can provide
+        an instance of :class:`CORSConfig`.
 
    .. method:: authorizer(name, \*\*options)
 
@@ -615,6 +615,17 @@ APIGateway
    There is a single instance of this class attached to each
    :class:`Chalice` object under the ``api`` attribute.
 
+   .. attribute:: cors
+
+      Global cors configuration. If a route-level cors configuration is not
+      provided, or is ``None`` then this configuration will be used. By
+      default it is set to ``False``. This can either be ``True``, ``False``,
+      or an instance of the ``CORSConfig`` class. This makes it easy to enable
+      CORS for your entire application by setting ``app.api.cors = True``.
+
+      .. versionadded:: 1.12.1
+
+
    .. attribute:: default_binary_types
 
       The value of ``default_binary_types`` are the ``Content-Types`` that are
@@ -707,7 +718,7 @@ WebsocketAPI
       Configure prepares the :class:`WebsocketAPI` to call the :meth:`send`
       method. Without first calling this method calls to :meth:`send` will fail
       with the message ``WebsocketAPI needs to be configured before sending
-      messages.``. This is because a boto3 ``apigatewaymanagmentapi`` client
+      messages.``. This is because a boto3 ``apigatewaymanagementapi`` client
       must be created from the :attr:`session` with a custom endpoint in order
       to properly communicate with our API Gateway WebsocketAPI. This method is
       called on your behalf before each of the websocket handlers:
@@ -718,9 +729,42 @@ WebsocketAPI
 
    .. method:: send(connection_id, message)
 
+      *requires* ``boto3>=1.9.91``
+
       Method to send a message to a client. The ``connection_id`` is the unique
       identifier of the socket to send the ``message`` to. The ``message`` must
       be a utf-8 string.
+
+      If the socket is disconnected it raises a :class:`WebsocketDisconnectedError`
+      error.
+
+   .. method:: close(connection_id)
+
+      *requires* ``boto3>=1.9.221``
+
+      Method to close a WebSocket connection. The ``connection_id`` is the
+      unique identifier of the socket to close.
+
+      If the socket is already disconnected it raises a
+      :class:`WebsocketDisconnectedError` error.
+
+   .. method:: info(connection_id)
+
+      *requires* ``boto3>=1.9.221``
+
+      Method to get info about a WebSocket. The ``connection_id`` is the unique
+      identifier of the socket to get info about.
+
+      The following is an example of the format this method returns::
+
+       {
+           'ConnectedAt': datetime(2015, 1, 1),
+           'Identity': {
+               'SourceIp': 'string',
+               'UserAgent': 'string'
+           },
+           'LastActiveAt': datetime(2015, 1, 1)
+       }
 
       If the socket is disconnected it raises a :class:`WebsocketDisconnectedError`
       error.
@@ -739,7 +783,7 @@ CORS
 
 .. class:: CORSConfig(allow_origin='*', allow_headers=None, expose_headers=None, max_age=None, allow_credentials=None)
 
-  CORS configuration to attach to a route.
+  CORS configuration to attach to a route, or globally on ``app.api.cors``.
 
   .. code-block:: python
 

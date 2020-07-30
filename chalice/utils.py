@@ -8,15 +8,20 @@ import re
 import shutil
 import sys
 import tarfile
+from datetime import datetime, timedelta
 import subprocess
 
+
+from collections import OrderedDict # noqa
 import click
-from typing import IO, Dict, List, Any, Tuple, Iterator, BinaryIO  # noqa
+from typing import IO, Dict, List, Any, Tuple, Iterator, BinaryIO, Text  # noqa
 from typing import Optional, Union  # noqa
-from typing import MutableMapping  # noqa
+from typing import MutableMapping, Callable  # noqa
+from typing import cast  # noqa
+import dateutil.parser
+from dateutil.tz import tzutc
 
 from chalice.constants import WELCOME_PROMPT
-
 
 OptInt = Optional[int]
 OptStr = Optional[str]
@@ -96,6 +101,55 @@ def serialize_to_json(data):
     return json.dumps(data, indent=2, separators=(',', ': ')) + '\n'
 
 
+class ChaliceZipFile(zipfile.ZipFile):
+    """Support deterministic zipfile generation.
+
+    Normalizes datetime and permissions.
+
+    """
+
+    compression = 0  # Try to make mypy happy.
+    _default_time_time = (1980, 1, 1, 0, 0, 0)
+
+    def __init__(self, *args, **kwargs):
+        # type: (Any, Any) -> None
+        self._osutils = cast(OSUtils, kwargs.pop('osutils', OSUtils()))
+        super(ChaliceZipFile, self).__init__(*args, **kwargs)
+
+    # pylint: disable=W0221
+    def write(self, filename, arcname=None, compress_type=None):
+        # type: (Text, Optional[Text], Optional[int]) -> None
+        # Only supports files, py2.7 and 3 have different signatures.
+        # We know that in our packager code we never call write() on
+        # directories.
+        zinfo = self._create_zipinfo(filename, arcname, compress_type)
+        with open(filename, 'rb') as f:
+            self.writestr(zinfo, f.read())
+
+    def _create_zipinfo(self, filename, arcname, compress_type):
+        # type: (Text, Optional[Text], Optional[int]) -> zipfile.ZipInfo
+        # The main thing that prevents deterministic zip file generation
+        # is that the mtime of the file is included in the zip metadata.
+        # We don't actually care what the mtime is when we run on lambda,
+        # so we always set it to the default value (which comes from
+        # zipfile.py).  This ensures that as long as the file contents don't
+        # change (or the permissions) then we'll always generate the exact
+        # same zip file bytes.
+        # We also can't use ZipInfo.from_file(), it's only in python3.
+        st = self._osutils.stat(str(filename))
+        if arcname is None:
+            arcname = filename
+        arcname = self._osutils.normalized_filename(str(arcname))
+        arcname = arcname.lstrip(os.sep)
+        zinfo = zipfile.ZipInfo(arcname, self._default_time_time)
+        # The external_attr needs the upper 16 bits to be the file mode
+        # so we have to shift it up to the right place.
+        zinfo.external_attr = (st.st_mode & 0xFFFF) << 16
+        zinfo.file_size = st.st_size
+        zinfo.compress_type = compress_type or self.compression
+        return zinfo
+
+
 def create_zip_file(source_dir, outfile):
     # type: (str, str) -> None
     """Create a zip file from a source input directory.
@@ -106,8 +160,9 @@ def create_zip_file(source_dir, outfile):
     specified by the `outfile` argument.
 
     """
-    with zipfile.ZipFile(outfile, 'w',
-                         compression=zipfile.ZIP_DEFLATED) as z:
+    with ChaliceZipFile(outfile, 'w',
+                        compression=zipfile.ZIP_DEFLATED,
+                        osutils=OSUtils()) as z:
         for root, _, filenames in os.walk(source_dir):
             for filename in filenames:
                 full_name = os.path.join(root, filename)
@@ -128,7 +183,8 @@ class OSUtils(object):
 
     def open_zip(self, filename, mode, compression=ZIP_DEFLATED):
         # type: (str, str, int) -> zipfile.ZipFile
-        return zipfile.ZipFile(filename, mode, compression=compression)
+        return ChaliceZipFile(filename, mode, compression=compression,
+                              osutils=self)
 
     def remove_file(self, filename):
         # type: (str) -> None
@@ -201,9 +257,9 @@ class OSUtils(object):
         # type: (str) -> str
         return os.path.join(*args)
 
-    def walk(self, path):
-        # type: (str) -> Iterator[Tuple[str, List[str], List[str]]]
-        return os.walk(path)
+    def walk(self, path, followlinks=False):
+        # type: (str, bool) -> Iterator[Tuple[str, List[str], List[str]]]
+        return os.walk(path, followlinks=followlinks)
 
     def copytree(self, source, destination):
         # type: (str, str) -> None
@@ -247,6 +303,20 @@ class OSUtils(object):
     def mtime(self, path):
         # type: (str) -> int
         return os.stat(path).st_mtime
+
+    def stat(self, path):
+        # type: (str)  -> os.stat_result
+        return os.stat(path)
+
+    def normalized_filename(self, path):
+        # type: (str) -> str
+        """Normalize a path into a filename.
+
+        This will normalize a file and remove any 'drive' component
+        from the path on OSes that support drive specifications.
+
+        """
+        return os.path.normpath(os.path.splitdrive(path)[1])
 
     @property
     def pipe(self):
@@ -302,3 +372,49 @@ class PipeReader(object):
         if not self._stream.isatty():
             return self._stream.read()
         return None
+
+
+class TimestampConverter(object):
+    # This is roughly based off of what's used in the AWS CLI.
+    _RELATIVE_TIMESTAMP_REGEX = re.compile(
+        r"(?P<amount>\d+)(?P<unit>s|m|h|d|w)$"
+    )
+    _TO_SECONDS = {
+        's': 1,
+        'm': 60,
+        'h': 3600,
+        'd': 24 * 3600,
+        'w': 7 * 24 * 3600,
+    }
+
+    def __init__(self, now=None):
+        # type: (Callable[[], datetime]) -> None
+        if now is None:
+            now = datetime.utcnow
+        self._now = now
+
+    def timestamp_to_datetime(self, timestamp):
+        # type: (str) -> datetime
+        """Convert a timestamp to a datetime object.
+
+        This method detects what type of timestamp is provided and
+        parse is appropriately to a timestamp object.
+
+        """
+        re_match = self._RELATIVE_TIMESTAMP_REGEX.match(timestamp)
+        if re_match:
+            datetime_value = self._relative_timestamp_to_datetime(
+                int(re_match.group('amount')), re_match.group('unit')
+            )
+        else:
+            datetime_value = self.parse_iso8601_timestamp(timestamp)
+        return datetime_value
+
+    def _relative_timestamp_to_datetime(self, amount, unit):
+        # type: (int, str) -> datetime
+        multiplier = self._TO_SECONDS[unit]
+        return self._now() + timedelta(seconds=amount * multiplier * -1)
+
+    def parse_iso8601_timestamp(self, timestamp):
+        # type: (str) -> datetime
+        return dateutil.parser.parse(timestamp, tzinfos={'GMT': tzutc()})

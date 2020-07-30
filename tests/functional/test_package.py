@@ -7,6 +7,7 @@ from collections import defaultdict, namedtuple
 import pytest
 import mock
 
+from chalice.awsclient import TypedAWSClient
 from chalice.config import Config
 from chalice import Chalice
 from chalice import package
@@ -19,6 +20,7 @@ from chalice.deploy.packager import SDistMetadataFetcher
 from chalice.deploy.packager import InvalidSourceDistributionNameError
 from chalice.compat import pip_no_compile_c_env_vars
 from chalice.compat import pip_no_compile_c_shim
+from chalice.package import PackageOptions
 from chalice.utils import OSUtils
 
 
@@ -251,6 +253,56 @@ class TestDependencyBuilder(object):
         pip.validate()
         assert ['foo'] == installed_packages
 
+    def test_can_get_sdist_if_missing_initially(self, tmpdir, pip_runner):
+        reqs = ['foo']
+        pip, runner = pip_runner
+        appdir, builder = self._make_appdir_and_dependency_builder(
+            reqs, tmpdir, runner)
+        requirements_file = os.path.join(appdir, 'requirements.txt')
+        # Initial download yields  an incompatible wheel
+        pip.packages_to_download(
+            expected_args=['-r', requirements_file, '--dest', mock.ANY],
+            packages=[
+                'foo-1.2-cp36-cp36m-macosx_10_6_intel.whl'
+            ]
+        )
+        # Secondary download for a compatible only one fails
+        pip.packages_to_download(
+            expected_args=[
+                '--only-binary=:all:', '--no-deps', '--platform',
+                'manylinux1_x86_64', '--implementation', 'cp',
+                '--abi', 'cp36m', '--dest', mock.ANY,
+                'foo==1.2'
+            ],
+            packages=[]
+        )
+        # Third download for an sdist succeeds
+        pip.packages_to_download(
+            expected_args=[
+                '--no-binary=:all:', '--no-deps', '--dest', mock.ANY,
+                'foo==1.2'
+            ],
+            packages=[
+                'foo-1.2.zip',
+            ]
+        )
+        # Wheel successfully builds
+        pip.wheels_to_build(
+            expected_args=['--no-deps', '--wheel-dir', mock.ANY,
+                           PathArgumentEndingWith('foo-1.2.zip')],
+            wheels_to_build=[
+                'foo-1.2-cp36-none-any.whl'
+            ]
+        )
+
+        site_packages = os.path.join(appdir, '.chalice.', 'site-packages')
+        builder.build_site_packages('cp36m', requirements_file, site_packages)
+        installed_packages = os.listdir(site_packages)
+
+        pip.validate()
+        for req in reqs:
+            assert req in installed_packages
+
     def test_can_get_whls_all_manylinux(self, tmpdir, pip_runner):
         reqs = ['foo', 'bar']
         pip, runner = pip_runner
@@ -319,6 +371,28 @@ class TestDependencyBuilder(object):
         for req in reqs:
             assert req in installed_packages
 
+    def test_can_normalize_dirname_for_purelib_whl(self, tmpdir, pip_runner):
+        reqs = ['foo']
+        pip, runner = pip_runner
+        appdir, builder = self._make_appdir_and_dependency_builder(
+            reqs, tmpdir, runner)
+        requirements_file = os.path.join(appdir, 'requirements.txt')
+        pip.packages_to_download(
+            expected_args=['-r', requirements_file, '--dest', mock.ANY],
+            packages=[
+                'foo-1.2-cp36-cp36m-manylinux1_x86_64.whl'
+            ],
+            whl_contents=['Foo-1.2.data/purelib/foo/']
+        )
+
+        site_packages = os.path.join(appdir, '.chalice.', 'site-packages')
+        builder.build_site_packages('cp36m', requirements_file, site_packages)
+        installed_packages = os.listdir(site_packages)
+
+        pip.validate()
+        for req in reqs:
+            assert req in installed_packages
+
     def test_can_expand_platlib_whl(self, tmpdir, pip_runner):
         reqs = ['foo']
         pip, runner = pip_runner
@@ -330,7 +404,7 @@ class TestDependencyBuilder(object):
             packages=[
                 'foo-1.2-cp36-cp36m-manylinux1_x86_64.whl'
             ],
-            whl_contents=['foo-1.2.data/platlib/foo/']
+            whl_contents=['Foo-1.2.data/platlib/foo/']
         )
 
         site_packages = os.path.join(appdir, '.chalice.', 'site-packages')
@@ -853,7 +927,7 @@ class TestDependencyBuilder(object):
         assert installed_packages == ['bar']
 
 
-def test_can_create_app_packager_with_no_autogen(tmpdir):
+def test_can_create_app_packager_with_no_autogen(tmpdir, stubbed_session):
     appdir = _create_app_structure(tmpdir)
 
     outdir = tmpdir.mkdir('outdir')
@@ -861,7 +935,8 @@ def test_can_create_app_packager_with_no_autogen(tmpdir):
     config = Config.create(project_dir=str(appdir),
                            chalice_app=sample_app(),
                            **default_params)
-    p = package.create_app_packager(config)
+    options = PackageOptions(TypedAWSClient(session=stubbed_session))
+    p = package.create_app_packager(config, options)
     p.package_app(config, str(outdir), 'dev')
     # We're not concerned with the contents of the files
     # (those are tested in the unit tests), we just want to make
@@ -871,14 +946,52 @@ def test_can_create_app_packager_with_no_autogen(tmpdir):
     assert 'sam.json' in contents
 
 
-def test_will_create_outdir_if_needed(tmpdir):
+def test_can_create_app_packager_with_yaml_extention(tmpdir, stubbed_session):
+    appdir = _create_app_structure(tmpdir)
+
+    outdir = tmpdir.mkdir('outdir')
+    default_params = {'autogen_policy': True}
+    extras_file = tmpdir.join('extras.yaml')
+    extras_file.write("foo: bar")
+    config = Config.create(project_dir=str(appdir),
+                           chalice_app=sample_app(),
+                           **default_params)
+    options = PackageOptions(TypedAWSClient(session=stubbed_session))
+    p = package.create_app_packager(config, options,
+                                    merge_template=str(extras_file))
+
+    p.package_app(config, str(outdir), 'dev')
+    contents = os.listdir(str(outdir))
+    assert 'deployment.zip' in contents
+    assert 'sam.yaml' in contents
+
+
+def test_can_specify_yaml_output(tmpdir, stubbed_session):
+    appdir = _create_app_structure(tmpdir)
+
+    outdir = tmpdir.mkdir('outdir')
+    default_params = {'autogen_policy': True}
+    config = Config.create(project_dir=str(appdir),
+                           chalice_app=sample_app(),
+                           **default_params)
+    options = PackageOptions(TypedAWSClient(session=stubbed_session))
+    p = package.create_app_packager(config, options, template_format='yaml')
+
+    p.package_app(config, str(outdir), 'dev')
+    contents = os.listdir(str(outdir))
+    assert 'deployment.zip' in contents
+    assert 'sam.yaml' in contents
+
+
+def test_will_create_outdir_if_needed(tmpdir, stubbed_session):
     appdir = _create_app_structure(tmpdir)
     outdir = str(appdir.join('outdir'))
     default_params = {'autogen_policy': True}
     config = Config.create(project_dir=str(appdir),
                            chalice_app=sample_app(),
                            **default_params)
-    p = package.create_app_packager(config)
+    options = PackageOptions(TypedAWSClient(session=stubbed_session))
+    p = package.create_app_packager(config, options)
     p.package_app(config, str(outdir), 'dev')
     contents = os.listdir(str(outdir))
     assert 'deployment.zip' in contents
